@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -18,7 +19,6 @@ from pathlib import Path
 import torch
 import triton
 import triton.language as tl
-
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -81,9 +81,7 @@ def _make_inputs(num_tokens: int, topk: int = 2048):
     indexer_k_cache = torch.empty(
         num_blocks, block_size, 132, device=device, dtype=torch.uint8
     )
-    mla_kv_cache = torch.empty(
-        num_blocks, block_size, 576, device=device, dtype=dtype
-    )
+    mla_kv_cache = torch.empty(num_blocks, block_size, 576, device=device, dtype=dtype)
     mla_k_scale = torch.ones(1, device=device, dtype=torch.float32)
 
     return {
@@ -106,8 +104,43 @@ def _make_inputs(num_tokens: int, topk: int = 2048):
     }
 
 
+def _make_fused_q_inputs(num_tokens: int):
+    device = "cuda"
+    dtype = torch.bfloat16
+    max_pos = max(4096, num_tokens + 16)
+    num_q_heads = 128
+    num_index_q_heads = 256
+    q_pe_dim = 64
+    index_q_dim = 128
+    ql_nope_dim = 512
+
+    return {
+        "positions": torch.arange(num_tokens, device=device, dtype=torch.int64),
+        "q_pe": torch.randn(
+            num_tokens, num_q_heads, q_pe_dim, device=device, dtype=dtype
+        ),
+        "q_pe_cache": torch.randn(max_pos, q_pe_dim, device=device, dtype=dtype),
+        "index_q": torch.randn(
+            num_tokens, num_index_q_heads, index_q_dim, device=device, dtype=dtype
+        ),
+        "index_q_cache": torch.randn(max_pos, index_q_dim, device=device, dtype=dtype),
+        "ql_nope": torch.randn(
+            num_tokens, num_q_heads, ql_nope_dim, device=device, dtype=dtype
+        ),
+        "q_scale": torch.ones(1, device=device, dtype=torch.float32),
+        "index_weights": torch.randn(
+            num_tokens, num_index_q_heads, device=device, dtype=dtype
+        ),
+        "index_weights_softmax_scale": index_q_dim**-0.5,
+        "index_weights_head_scale": num_index_q_heads**-0.5,
+    }
+
+
 def _clone_inputs(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {name: tensor.clone() for name, tensor in inputs.items()}
+    return {
+        name: tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
+        for name, tensor in inputs.items()
+    }
 
 
 def _run_triton(triton_kernels, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -157,6 +190,36 @@ def _run_helion(helion_kernels, inputs: dict[str, torch.Tensor]) -> torch.Tensor
         mla_kv_cache=inputs["mla_kv_cache"],
         mla_kv_cache_dtype="auto",
         mla_k_scale=inputs["mla_k_scale"],
+    )
+
+
+def _run_fused_q_triton(triton_kernels, inputs: dict[str, torch.Tensor]):
+    return triton_kernels.fused_q(
+        inputs["positions"],
+        inputs["q_pe"],
+        inputs["q_pe_cache"],
+        inputs["index_q"],
+        inputs["index_q_cache"],
+        inputs["ql_nope"],
+        inputs["q_scale"],
+        inputs["index_weights"],
+        inputs["index_weights_softmax_scale"],
+        inputs["index_weights_head_scale"],
+    )
+
+
+def _run_fused_q_helion(helion_kernels, inputs: dict[str, torch.Tensor]):
+    return helion_kernels.fused_q_helion(
+        inputs["positions"],
+        inputs["q_pe"],
+        inputs["q_pe_cache"],
+        inputs["index_q"],
+        inputs["index_q_cache"],
+        inputs["ql_nope"],
+        inputs["q_scale"],
+        inputs["index_weights"],
+        inputs["index_weights_softmax_scale"],
+        inputs["index_weights_head_scale"],
     )
 
 
@@ -210,6 +273,31 @@ def _check_correctness(triton_kernels, helion_kernels, base_inputs) -> str:
     return "OK"
 
 
+def _check_fused_q_correctness(triton_kernels, helion_kernels, base_inputs) -> str:
+    triton_inputs = _clone_inputs(base_inputs)
+    helion_inputs = _clone_inputs(base_inputs)
+
+    triton_out = _run_fused_q_triton(triton_kernels, triton_inputs)
+    helion_out = _run_fused_q_helion(helion_kernels, helion_inputs)
+    torch.cuda.synchronize()
+
+    names = ["index_q_fp8", "index_weights", "mqa_q"]
+    checks = []
+    for name, triton_tensor, helion_tensor in zip(names, triton_out, helion_out):
+        if name == "index_weights":
+            ok = torch.allclose(triton_tensor, helion_tensor, rtol=1e-2, atol=1e-2)
+            diff = _max_diff(triton_tensor, helion_tensor)
+        else:
+            ok = torch.equal(triton_tensor, helion_tensor)
+            diff = _max_diff(triton_tensor, helion_tensor)
+        checks.append((name, ok, diff))
+
+    failed = [f"{name}:max_diff={diff:.6g}" for name, ok, diff in checks if not ok]
+    if failed:
+        return "FAIL(" + ";".join(failed) + ")"
+    return "OK"
+
+
 def _bench(fn, warmup: int = 10, repeat: int = 50) -> float:
     for _ in range(warmup):
         fn()
@@ -220,6 +308,30 @@ def _bench(fn, warmup: int = 10, repeat: int = 50) -> float:
     start.record()
     for _ in range(repeat):
         fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / repeat
+
+
+def _bench_cuda_graph(fn, warmup: int = 10, repeat: int = 100) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
+    torch.cuda.synchronize()
+
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(repeat):
+        graph.replay()
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / repeat
@@ -238,9 +350,19 @@ def main() -> None:
     )
 
     print("GPU:", torch.cuda.get_device_name())
-    print("tokens,correctness,triton_ms,helion_ms,helion/triton")
+    print("kernel=fused_norm_rope")
+    print(
+        "tokens,correctness,triton_ms,helion_ms,helion/triton,"
+        "triton_graph_ms,helion_graph_ms,helion_graph/triton_graph"
+    )
 
-    for num_tokens in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]:
+    token_env = os.environ.get("DS32_TOKENS")
+    if token_env:
+        token_counts = [int(token) for token in token_env.split(",")]
+    else:
+        token_counts = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+    for num_tokens in token_counts:
         base_inputs = _make_inputs(num_tokens)
         correctness = _check_correctness(triton_kernels, helion_kernels, base_inputs)
         inputs = _clone_inputs(base_inputs)
@@ -255,14 +377,56 @@ def main() -> None:
         try:
             helion_ms = _bench(run_helion)
             ratio = helion_ms / triton_ms
+            triton_graph_ms = _bench_cuda_graph(run_triton)
+            helion_graph_ms = _bench_cuda_graph(run_helion)
+            graph_ratio = helion_graph_ms / triton_graph_ms
             print(
                 f"{num_tokens},{correctness},{triton_ms:.6f},"
-                f"{helion_ms:.6f},{ratio:.3f}"
+                f"{helion_ms:.6f},{ratio:.3f},"
+                f"{triton_graph_ms:.6f},{helion_graph_ms:.6f},"
+                f"{graph_ratio:.3f}"
             )
         except Exception as e:
             print(
                 f"{num_tokens},{correctness},{triton_ms:.6f},"
-                f"ERROR,{type(e).__name__}: {e}"
+                f"ERROR,{type(e).__name__}: {e},,,"
+            )
+
+    print("kernel=fused_q")
+    print(
+        "tokens,correctness,triton_ms,helion_ms,helion/triton,"
+        "triton_graph_ms,helion_graph_ms,helion_graph/triton_graph"
+    )
+    for num_tokens in token_counts:
+        base_inputs = _make_fused_q_inputs(num_tokens)
+        correctness = _check_fused_q_correctness(
+            triton_kernels, helion_kernels, base_inputs
+        )
+        inputs = _clone_inputs(base_inputs)
+
+        def run_triton_q():
+            return _run_fused_q_triton(triton_kernels, inputs)
+
+        def run_helion_q():
+            return _run_fused_q_helion(helion_kernels, inputs)
+
+        triton_ms = _bench(run_triton_q)
+        try:
+            helion_ms = _bench(run_helion_q)
+            ratio = helion_ms / triton_ms
+            triton_graph_ms = _bench_cuda_graph(run_triton_q)
+            helion_graph_ms = _bench_cuda_graph(run_helion_q)
+            graph_ratio = helion_graph_ms / triton_graph_ms
+            print(
+                f"{num_tokens},{correctness},{triton_ms:.6f},"
+                f"{helion_ms:.6f},{ratio:.3f},"
+                f"{triton_graph_ms:.6f},{helion_graph_ms:.6f},"
+                f"{graph_ratio:.3f}"
+            )
+        except Exception as e:
+            print(
+                f"{num_tokens},{correctness},{triton_ms:.6f},"
+                f"ERROR,{type(e).__name__}: {e},,,"
             )
 
 

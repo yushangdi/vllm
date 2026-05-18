@@ -20,6 +20,41 @@ if has_helion():
     import helion.language as hl
 
 
+def _cuda_graph_autotune_benchmark(
+    fns: list,
+    *,
+    repeat: int,
+    desc: str | None = None,
+) -> list[float]:
+    timings: list[float] = []
+    for fn in fns:
+        try:
+            for _ in range(5):
+                fn()
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fn()
+            torch.cuda.synchronize()
+
+            for _ in range(5):
+                graph.replay()
+            torch.cuda.synchronize()
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(repeat):
+                graph.replay()
+            end.record()
+            torch.cuda.synchronize()
+            timings.append(start.elapsed_time(end) / repeat)
+        except Exception:
+            timings.append(float("inf"))
+    return timings
+
+
 def _require_helion() -> None:
     if not has_helion():
         raise ImportError(
@@ -30,7 +65,10 @@ def _require_helion() -> None:
 
 if has_helion():
 
-    @helion.kernel(static_shapes=False, autotune_effort="none")
+    @helion.kernel(
+        static_shapes=False,
+        autotune_benchmark_fn=_cuda_graph_autotune_benchmark,
+    )
     def _fused_norm_rope_helion_kernel(
         positions: torch.Tensor,
         # Q RMS norm
@@ -114,14 +152,16 @@ if has_helion():
 
             mla_block_idx = slot_idx // mla_cache_block_size
             mla_block_off = slot_idx - mla_block_idx * mla_cache_block_size
-            mla_base = mla_block_idx * mla_block_stride + mla_block_off * mla_entry_stride
+            mla_base = (
+                mla_block_idx * mla_block_stride + mla_block_off * mla_entry_stride
+            )
             kv_offsets = hl.arange(0, kv_dim)
             mla_cache_flat[mla_base[:, None] + kv_offsets[None, :]] = kv_normed.to(
                 mla_cache_flat.dtype
             )
-            mla_cache_flat[
-                mla_base[:, None] + kv_dim + kpe_offsets[None, :] * 2
-            ] = kpe_r1.to(mla_cache_flat.dtype)
+            mla_cache_flat[mla_base[:, None] + kv_dim + kpe_offsets[None, :] * 2] = (
+                kpe_r1.to(mla_cache_flat.dtype)
+            )
             mla_cache_flat[
                 mla_base[:, None] + kv_dim + kpe_offsets[None, :] * 2 + 1
             ] = kpe_r2.to(mla_cache_flat.dtype)
@@ -148,19 +188,15 @@ if has_helion():
             idx_b_hi = index_k_layer_norm_bias[index_k_half + idx_offsets].to(
                 torch.float32
             )
-            idx_normed_lo = (
-                (idx_lo - idx_mean[:, None]) * idx_rstd[:, None] * idx_w_lo
-            )
-            idx_normed_hi = (
-                (idx_hi - idx_mean[:, None]) * idx_rstd[:, None] * idx_w_hi
-            )
+            idx_normed_lo = (idx_lo - idx_mean[:, None]) * idx_rstd[:, None] * idx_w_lo
+            idx_normed_hi = (idx_hi - idx_mean[:, None]) * idx_rstd[:, None] * idx_w_hi
             idx_normed_lo = idx_normed_lo + idx_b_lo
             idx_normed_hi = idx_normed_hi + idx_b_hi
 
             idx_cos = index_k_rope_cos_sin_cache[pos, idx_offsets].to(torch.float32)
-            idx_sin = index_k_rope_cos_sin_cache[
-                pos, index_k_half + idx_offsets
-            ].to(torch.float32)
+            idx_sin = index_k_rope_cos_sin_cache[pos, index_k_half + idx_offsets].to(
+                torch.float32
+            )
             idx_roped_lo = idx_normed_lo * idx_cos - idx_normed_hi * idx_sin
             idx_roped_hi = idx_normed_hi * idx_cos + idx_normed_lo * idx_sin
             idx_abs = torch.maximum(torch.abs(idx_roped_lo), torch.abs(idx_roped_hi))
@@ -174,23 +210,225 @@ if has_helion():
                 idx_block_idx * indexer_cache_block_size * indexer_cache_stride
             )
             idx_value_base = idx_block_start + idx_block_off * index_k_dim
-            indexer_cache_fp8_flat[
-                idx_value_base[:, None] + idx_offsets[None, :]
-            ] = (idx_roped_lo / idx_scale[:, None]).to(indexer_cache_fp8_flat.dtype)
+            indexer_cache_fp8_flat[idx_value_base[:, None] + idx_offsets[None, :]] = (
+                idx_roped_lo / idx_scale[:, None]
+            ).to(indexer_cache_fp8_flat.dtype)
             indexer_cache_fp8_flat[
                 idx_value_base[:, None] + index_k_half + idx_offsets[None, :]
             ] = (idx_roped_hi / idx_scale[:, None]).to(indexer_cache_fp8_flat.dtype)
 
             idx_scale_byte_off = (
-                idx_block_start + indexer_cache_block_size * index_k_dim
+                idx_block_start
+                + indexer_cache_block_size * index_k_dim
                 + idx_block_off * 4
             )
             indexer_cache_scale_flat[idx_scale_byte_off // 4] = idx_scale
 
         return q_c_out
 
+    @helion.kernel(static_shapes=False)
+    def _fused_q_helion_kernel(
+        positions: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_pe_cos_sin_cache: torch.Tensor,
+        q_pe_cos_sin_cache_flat: torch.Tensor,
+        index_q: torch.Tensor,
+        index_q_cos_sin_cache: torch.Tensor,
+        index_q_cos_sin_cache_flat: torch.Tensor,
+        ql_nope: torch.Tensor,
+        q_scale: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_softmax_scale: float,
+        index_weights_head_scale: float,
+        index_q_fp8: torch.Tensor,
+        index_weights_out: torch.Tensor,
+        mqa_q_fp8: torch.Tensor,
+    ) -> None:
+        num_tokens = positions.size(0)
+        num_q_heads = hl.specialize(q_pe.shape[1])
+        num_index_q_heads = hl.specialize(index_q.shape[1])
+        q_pe_dim = hl.specialize(q_pe.shape[2])
+        q_pe_half = hl.specialize(q_pe_dim // 2)
+        q_pe_cache_stride = hl.specialize(q_pe_cos_sin_cache.stride(0))
+        index_q_dim = hl.specialize(index_q.shape[2])
+        index_q_half = hl.specialize(index_q_dim // 2)
+        index_q_cache_stride = hl.specialize(index_q_cos_sin_cache.stride(0))
+        ql_nope_dim = hl.specialize(ql_nope.shape[2])
+
+        for pid, tile_t, tile_h in hl.grid([3, num_tokens, num_index_q_heads]):
+            if pid == 0:
+                if tile_h * 2 < num_q_heads:
+                    qpe_offsets = hl.arange(0, q_pe_half)
+                    pos = positions[tile_t]
+                    qpe_base = pos * q_pe_cache_stride
+                    qpe_cos = q_pe_cos_sin_cache_flat[qpe_base + qpe_offsets].to(
+                        torch.float32
+                    )
+                    qpe_sin = q_pe_cos_sin_cache_flat[
+                        qpe_base + q_pe_half + qpe_offsets
+                    ].to(torch.float32)
+                    qpe_scale = hl.load(q_scale, [0]).to(torch.float32)
+                    for local_head in hl.static_range(2):
+                        q_head = tile_h * 2 + local_head
+                        if q_head < num_q_heads:
+                            qpe_x1 = q_pe[tile_t, q_head, qpe_offsets * 2].to(
+                                torch.float32
+                            )
+                            qpe_x2 = q_pe[tile_t, q_head, qpe_offsets * 2 + 1].to(
+                                torch.float32
+                            )
+                            qpe_r1 = qpe_x1 * qpe_cos - qpe_x2 * qpe_sin
+                            qpe_r2 = qpe_x2 * qpe_cos + qpe_x1 * qpe_sin
+                            mqa_q_fp8[
+                                tile_t, q_head, ql_nope_dim + qpe_offsets * 2
+                            ] = (qpe_r1 / qpe_scale).to(mqa_q_fp8.dtype)
+                            mqa_q_fp8[
+                                tile_t, q_head, ql_nope_dim + qpe_offsets * 2 + 1
+                            ] = (qpe_r2 / qpe_scale).to(mqa_q_fp8.dtype)
+            elif pid == 1:
+                if tile_h < num_index_q_heads:
+                    index_offsets = hl.arange(0, index_q_half)
+                    pos = positions[tile_t]
+                    index_base = pos * index_q_cache_stride
+                    index_cos = index_q_cos_sin_cache_flat[
+                        index_base + index_offsets
+                    ].to(torch.float32)
+                    index_sin = index_q_cos_sin_cache_flat[
+                        index_base + index_q_half + index_offsets
+                    ].to(torch.float32)
+                    index_x1 = index_q[tile_t, tile_h, index_offsets].to(
+                        torch.float32
+                    )
+                    index_x2 = index_q[
+                        tile_t, tile_h, index_q_half + index_offsets
+                    ].to(torch.float32)
+                    index_r1 = index_x1 * index_cos - index_x2 * index_sin
+                    index_r2 = index_x2 * index_cos + index_x1 * index_sin
+                    index_r1 = index_r1.to(index_q.dtype).to(torch.float32)
+                    index_r2 = index_r2.to(index_q.dtype).to(torch.float32)
+
+                    index_abs = torch.maximum(torch.abs(index_r1), torch.abs(index_r2))
+                    index_amax = torch.amax(index_abs, dim=-1)
+                    index_scale = torch.clamp(index_amax, min=1e-4) / 448.0
+                    index_scale = torch.exp2(torch.ceil(torch.log2(index_scale)))
+                    index_q_fp8[tile_t, tile_h, index_offsets] = (
+                        index_r1 / index_scale
+                    ).to(index_q_fp8.dtype)
+                    index_q_fp8[tile_t, tile_h, index_q_half + index_offsets] = (
+                        index_r2 / index_scale
+                    ).to(index_q_fp8.dtype)
+
+                    weights = index_weights[tile_t, tile_h].to(torch.float32)
+                    weights = weights * index_scale
+                    weights = weights * index_weights_softmax_scale
+                    weights = weights * index_weights_head_scale
+                    index_weights_out[tile_t, tile_h] = weights
+            elif pid == 2:
+                if tile_h * 2 < num_q_heads:
+                    nope_offsets = hl.arange(0, ql_nope_dim)
+                    nope_scale = hl.load(q_scale, [0]).to(torch.float32)
+                    for local_head in hl.static_range(2):
+                        q_head = tile_h * 2 + local_head
+                        if q_head < num_q_heads:
+                            nope_vals = ql_nope[tile_t, q_head, nope_offsets].to(
+                                torch.float32
+                            )
+                            mqa_q_fp8[tile_t, q_head, nope_offsets] = (
+                                nope_vals / nope_scale
+                            ).to(mqa_q_fp8.dtype)
+
+    @helion.kernel(static_shapes=False)
+    def _fused_q_nope_pack_helion_kernel(
+        ql_nope: torch.Tensor,
+        q_scale: torch.Tensor,
+        mqa_q_fp8: torch.Tensor,
+    ) -> None:
+        num_tokens = ql_nope.size(0)
+        num_q_heads = hl.specialize(ql_nope.shape[1])
+        ql_nope_dim = hl.specialize(ql_nope.shape[2])
+        for tile_t, tile_h in hl.tile([num_tokens, num_q_heads]):
+            offsets = hl.arange(0, ql_nope_dim)
+            scale = hl.load(q_scale, [0]).to(torch.float32)
+            vals = ql_nope[tile_t, tile_h, offsets].to(torch.float32)
+            mqa_q_fp8[tile_t, tile_h, offsets] = (vals / scale).to(mqa_q_fp8.dtype)
+
+    @helion.kernel(static_shapes=False)
+    def _fused_q_pe_pack_helion_kernel(
+        positions: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_pe_cos_sin_cache: torch.Tensor,
+        q_scale: torch.Tensor,
+        mqa_q_fp8: torch.Tensor,
+        ql_nope_dim: int,
+    ) -> None:
+        num_tokens = q_pe.size(0)
+        num_q_heads = hl.specialize(q_pe.shape[1])
+        q_pe_dim = hl.specialize(q_pe.shape[2])
+        q_pe_half = hl.specialize(q_pe_dim // 2)
+        for tile_t, tile_h in hl.tile([num_tokens, num_q_heads]):
+            offsets = hl.arange(0, q_pe_half)
+            scale = hl.load(q_scale, [0]).to(torch.float32)
+            pos = positions[tile_t]
+            cos = q_pe_cos_sin_cache[pos, offsets].to(torch.float32)
+            sin = q_pe_cos_sin_cache[pos, q_pe_half + offsets].to(torch.float32)
+            x1 = q_pe[tile_t, tile_h, offsets * 2].to(torch.float32)
+            x2 = q_pe[tile_t, tile_h, offsets * 2 + 1].to(torch.float32)
+            r1 = x1 * cos - x2 * sin
+            r2 = x2 * cos + x1 * sin
+            mqa_q_fp8[tile_t, tile_h, ql_nope_dim + offsets * 2] = (r1 / scale).to(
+                mqa_q_fp8.dtype
+            )
+            mqa_q_fp8[tile_t, tile_h, ql_nope_dim + offsets * 2 + 1] = (r2 / scale).to(
+                mqa_q_fp8.dtype
+            )
+
+    @helion.kernel(static_shapes=False)
+    def _fused_index_q_helion_kernel(
+        positions: torch.Tensor,
+        index_q: torch.Tensor,
+        index_q_cos_sin_cache: torch.Tensor,
+        index_q_fp8: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_weights_softmax_scale: float,
+        index_weights_head_scale: float,
+        index_weights_out: torch.Tensor,
+    ) -> None:
+        num_tokens = index_q.size(0)
+        num_index_q_heads = hl.specialize(index_q.shape[1])
+        index_q_dim = hl.specialize(index_q.shape[2])
+        index_q_half = hl.specialize(index_q_dim // 2)
+        for tile_t, tile_h in hl.tile([num_tokens, num_index_q_heads]):
+            offsets = hl.arange(0, index_q_half)
+            pos = positions[tile_t]
+            cos = index_q_cos_sin_cache[pos, offsets].to(torch.float32)
+            sin = index_q_cos_sin_cache[pos, index_q_half + offsets].to(torch.float32)
+            x1 = index_q[tile_t, tile_h, offsets].to(torch.float32)
+            x2 = index_q[tile_t, tile_h, index_q_half + offsets].to(torch.float32)
+            r1 = x1 * cos - x2 * sin
+            r2 = x2 * cos + x1 * sin
+            r1 = r1.to(index_q.dtype).to(torch.float32)
+            r2 = r2.to(index_q.dtype).to(torch.float32)
+
+            abs_vals = torch.maximum(torch.abs(r1), torch.abs(r2))
+            amax = torch.amax(abs_vals, dim=-1)
+            scale = torch.clamp(amax, min=1e-4) / 448.0
+            scale = torch.exp2(torch.ceil(torch.log2(scale)))
+            index_q_fp8[tile_t, tile_h, offsets] = (r1 / scale[:, :, None]).to(
+                index_q_fp8.dtype
+            )
+            index_q_fp8[tile_t, tile_h, index_q_half + offsets] = (
+                r2 / scale[:, :, None]
+            ).to(index_q_fp8.dtype)
+
+            weights = index_weights[tile_t, tile_h].to(torch.float32)
+            weights = weights * scale
+            weights = weights * index_weights_softmax_scale
+            weights = weights * index_weights_head_scale
+            index_weights_out[tile_t, tile_h] = weights
+
 
 _fused_norm_rope_helion_last_num_tokens: int | None = None
+_fused_q_helion_last_num_tokens: int | None = None
 
 
 def fused_norm_rope_helion(
@@ -278,3 +516,64 @@ def fused_norm_rope_helion(
         mla_kv_cache,
         mla_kv_cache.flatten(),
     )
+
+
+def fused_q_helion(
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    q_pe_cos_sin_cache: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    ql_nope: torch.Tensor,
+    q_scale: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Helion version of ``kernels.fused_q``.
+
+    This mirrors the Triton branch-on-pid structure in one Helion launch.
+    """
+    _require_helion()
+
+    assert positions.ndim == 1
+    assert q_pe.ndim == 3
+    assert q_pe_cos_sin_cache.ndim == 2
+    assert index_q.ndim == 3
+    assert index_q_cos_sin_cache.ndim == 2
+    assert ql_nope.ndim == 3
+    assert ql_nope.shape[:2] == q_pe.shape[:2]
+
+    mqa_q_fp8 = torch.empty(
+        q_pe.shape[0],
+        q_pe.shape[1],
+        ql_nope.shape[2] + q_pe.shape[2],
+        dtype=current_platform.fp8_dtype(),
+        device=q_pe.device,
+    )
+    index_q_fp8 = torch.empty_like(index_q, dtype=current_platform.fp8_dtype())
+    index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+
+    global _fused_q_helion_last_num_tokens
+    if _fused_q_helion_last_num_tokens != positions.shape[0]:
+        _fused_q_helion_kernel.reset()
+        _fused_q_helion_last_num_tokens = positions.shape[0]
+
+    _fused_q_helion_kernel(
+        positions,
+        q_pe,
+        q_pe_cos_sin_cache,
+        q_pe_cos_sin_cache.flatten(),
+        index_q,
+        index_q_cos_sin_cache,
+        index_q_cos_sin_cache.flatten(),
+        ql_nope,
+        q_scale,
+        index_weights,
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_q_fp8,
+        index_weights_out,
+        mqa_q_fp8,
+    )
+    return index_q_fp8, index_weights_out, mqa_q_fp8
