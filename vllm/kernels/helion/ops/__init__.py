@@ -8,4 +8,6 @@ import pkgutil
 # Automatically import all submodules so that @register_kernel
 # decorators execute and register ops with torch.ops.vllm_helion.
 for _module_info in pkgutil.iter_modules(__path__):
+    if _module_info.name.startswith("bench_"):
+        continue
     importlib.import_module(f"{__name__}.{_module_info.name}")

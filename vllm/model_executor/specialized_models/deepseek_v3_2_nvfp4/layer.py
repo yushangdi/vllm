@@ -13,6 +13,8 @@ DecoderLayer:
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -37,7 +39,11 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-from .kernels import fused_norm_rope, fused_q
+if bool(int(os.getenv("VLLM_DS32_USE_HELION", "0"))):
+    from .helion_kernels import fused_norm_rope_helion as fused_norm_rope
+    from .helion_kernels import fused_q_helion as fused_q
+else:
+    from .kernels import fused_norm_rope, fused_q
 from .sparse_indexer import sparse_attn_indexer
 
 
@@ -131,6 +137,11 @@ def dsa(
         index_weights,
         attn.indexer_softmax_scale,
         attn.index_n_heads**-0.5,
+        (
+            torch.float8_e4m3fn
+            if mla.kv_cache_dtype.startswith("fp8")
+            else q_pe.dtype
+        ),
     )
 
     # Steps 5-6. Sparse indexer + MLA sparse decode attention

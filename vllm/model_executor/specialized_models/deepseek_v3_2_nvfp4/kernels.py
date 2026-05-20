@@ -494,6 +494,7 @@ def _fused_q_kernel(
     q_scale_ptr,
     QL_NOPE_DIM: tl.constexpr,
     QL_NOPE_BLOCK: tl.constexpr,
+    MQA_Q_FP8: tl.constexpr,
     # Index weights
     index_weights_ptr,
     index_weights_stride,
@@ -524,13 +525,14 @@ def _fused_q_kernel(
                     + ql_nope_off,
                     mask=ql_nope_mask,
                 ).to(tl.float32)
-                ql_nope_fp8 = (ql_nope / scale).to(tl.float8e4nv)
+                if MQA_Q_FP8:
+                    ql_nope = (ql_nope / scale).to(tl.float8e4nv)
                 tl.store(
                     mqa_q_fp8_ptr
                     + tok_idx * mqa_q_fp8_stride0
                     + q_head_idx * mqa_q_fp8_stride1
                     + ql_nope_off,
-                    ql_nope_fp8,
+                    ql_nope,
                     mask=ql_nope_mask,
                 )
         return
@@ -567,13 +569,16 @@ def _fused_q_kernel(
                 ).to(tl.float32)
                 r1 = x1 * cos - x2 * sin
                 r2 = x2 * cos + x1 * sin
+                if MQA_Q_FP8:
+                    r1 = (r1 / scale).to(tl.float8e4nv)
+                    r2 = (r2 / scale).to(tl.float8e4nv)
                 tl.store(
                     mqa_q_fp8_ptr
                     + tok_idx * mqa_q_fp8_stride0
                     + q_head_idx * mqa_q_fp8_stride1
                     + QL_NOPE_DIM
                     + rot_off * 2,
-                    (r1 / scale).to(tl.float8e4nv),
+                    r1,
                 )
                 tl.store(
                     mqa_q_fp8_ptr
@@ -582,7 +587,7 @@ def _fused_q_kernel(
                     + QL_NOPE_DIM
                     + rot_off * 2
                     + 1,
-                    (r2 / scale).to(tl.float8e4nv),
+                    r2,
                 )
         return
     elif pid == 1:
@@ -652,6 +657,7 @@ def fused_q(
     index_weights: torch.Tensor,
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
+    mqa_q_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert positions.ndim == 1
     assert q_pe.ndim == 3
@@ -669,7 +675,7 @@ def fused_q(
         q_pe.shape[0],
         q_pe.shape[1],
         ql_nope.shape[2] + q_pe.shape[2],
-        dtype=torch.float8_e4m3fn,
+        dtype=mqa_q_dtype,
         device=q_pe.device,
     )
 
@@ -704,6 +710,7 @@ def fused_q(
         q_scale,
         ql_nope.shape[2],
         triton.next_power_of_2(ql_nope.shape[2]),
+        mqa_q_dtype == torch.float8_e4m3fn,
         index_weights,
         index_weights.stride(0),
         index_weights_softmax_scale,

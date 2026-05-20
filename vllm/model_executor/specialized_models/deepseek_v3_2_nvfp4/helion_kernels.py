@@ -10,6 +10,9 @@ correctness tests and tuned configs are in place.
 
 from __future__ import annotations
 
+import re
+from typing import Any
+
 import torch
 
 from vllm.platforms import current_platform
@@ -18,41 +21,7 @@ from vllm.utils.import_utils import has_helion
 if has_helion():
     import helion
     import helion.language as hl
-
-
-def _cuda_graph_autotune_benchmark(
-    fns: list,
-    *,
-    repeat: int,
-    desc: str | None = None,
-) -> list[float]:
-    timings: list[float] = []
-    for fn in fns:
-        try:
-            for _ in range(5):
-                fn()
-            torch.cuda.synchronize()
-
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                fn()
-            torch.cuda.synchronize()
-
-            for _ in range(5):
-                graph.replay()
-            torch.cuda.synchronize()
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(repeat):
-                graph.replay()
-            end.record()
-            torch.cuda.synchronize()
-            timings.append(start.elapsed_time(end) / repeat)
-        except Exception:
-            timings.append(float("inf"))
-    return timings
+    from vllm.kernels.helion.register import register_kernel
 
 
 def _require_helion() -> None:
@@ -63,11 +32,181 @@ def _require_helion() -> None:
         )
 
 
+def _pick_num_tokens_config(args: tuple[Any, ...], config_keys: list[str]) -> str | None:
+    if not config_keys:
+        return None
+
+    num_tokens = args[0].shape[0]
+    available_tokens: list[int] = []
+    for key in config_keys:
+        if key == "default":
+            continue
+        match = re.fullmatch(r"numtokens_(\d+)", key)
+        if not match:
+            raise ValueError(
+                f"Malformed DS32 Helion config key '{key}', "
+                "expected 'numtokens_{int}'"
+            )
+        available_tokens.append(int(match.group(1)))
+
+    if not available_tokens:
+        return "default" if "default" in config_keys else None
+
+    available_tokens = sorted(available_tokens)
+    selected = next((n for n in available_tokens if n >= num_tokens), available_tokens[-1])
+    return f"numtokens_{selected}"
+
+
+def _ds32_num_tokens_to_tune() -> list[int]:
+    return [1, 8, 128, 1024, 8192]
+
+
+def generate_ds32_fused_norm_rope_inputs() -> dict[str, tuple[Any, ...]]:
+    device = "cuda"
+    dtype = torch.bfloat16
+    max_pos = 163840
+    q_dim = 1536
+    kv_dim = 512
+    qk_rope_head_dim = 64
+    index_head_dim = 128
+    indexer_cache_head_dim = index_head_dim + index_head_dim // 128 * 4
+    block_size = 64
+    topk = 2048
+    inputs: dict[str, tuple[Any, ...]] = {}
+
+    for num_tokens in _ds32_num_tokens_to_tune():
+        num_blocks = max(1, (num_tokens + block_size - 1) // block_size)
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        q_c = torch.randn(num_tokens, q_dim, device=device, dtype=dtype)
+        q_rms_norm_w = torch.randn(q_dim, device=device, dtype=dtype)
+        kv_c = torch.randn(num_tokens, kv_dim, device=device, dtype=dtype)
+        kv_rms_norm_w = torch.randn(kv_dim, device=device, dtype=dtype)
+        k_pe = torch.randn(num_tokens, qk_rope_head_dim, device=device, dtype=dtype)
+        k_rope_cos_sin_cache = torch.randn(
+            max_pos, qk_rope_head_dim, device=device, dtype=dtype
+        )
+        index_k = torch.randn(num_tokens, index_head_dim, device=device, dtype=dtype)
+        index_k_layer_norm_w = torch.randn(
+            index_head_dim, device=device, dtype=dtype
+        )
+        index_k_layer_norm_bias = torch.randn(
+            index_head_dim, device=device, dtype=dtype
+        )
+        index_k_rope_cos_sin_cache = torch.randn(
+            max_pos, index_head_dim, device=device, dtype=dtype
+        )
+        topk_indices_buffer = torch.empty(
+            num_tokens, topk, device=device, dtype=torch.int32
+        )
+        slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        indexer_cache = torch.empty(
+            num_blocks,
+            block_size,
+            indexer_cache_head_dim,
+            device=device,
+            dtype=torch.uint8,
+        )
+        mla_cache = torch.empty(
+            num_blocks,
+            block_size,
+            kv_dim + qk_rope_head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        inputs[f"numtokens_{num_tokens}"] = (
+            positions,
+            q_c,
+            q_rms_norm_w,
+            1e-6,
+            kv_c,
+            kv_rms_norm_w,
+            1e-6,
+            k_pe,
+            k_rope_cos_sin_cache,
+            index_k,
+            index_k_layer_norm_w,
+            index_k_layer_norm_bias,
+            1e-6,
+            index_k_rope_cos_sin_cache,
+            topk_indices_buffer,
+            slot_mapping,
+            indexer_cache.view(current_platform.fp8_dtype()),
+            indexer_cache.view(current_platform.fp8_dtype()).flatten(),
+            indexer_cache.view(torch.float32).flatten(),
+            mla_cache,
+            mla_cache.flatten(),
+        )
+
+    return inputs
+
+
+def generate_ds32_fused_q_inputs() -> dict[str, tuple[Any, ...]]:
+    device = "cuda"
+    dtype = torch.bfloat16
+    max_pos = 163840
+    num_q_heads = 32
+    num_index_q_heads = 64
+    qk_rope_head_dim = 64
+    index_head_dim = 128
+    kv_lora_rank = 512
+    inputs: dict[str, tuple[Any, ...]] = {}
+
+    for num_tokens in _ds32_num_tokens_to_tune():
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        q_pe = torch.randn(
+            num_tokens, num_q_heads, qk_rope_head_dim, device=device, dtype=dtype
+        )
+        q_pe_cos_sin_cache = torch.randn(
+            max_pos, qk_rope_head_dim, device=device, dtype=dtype
+        )
+        index_q = torch.randn(
+            num_tokens, num_index_q_heads, index_head_dim, device=device, dtype=dtype
+        )
+        index_q_cos_sin_cache = torch.randn(
+            max_pos, index_head_dim, device=device, dtype=dtype
+        )
+        ql_nope = torch.randn(
+            num_tokens, num_q_heads, kv_lora_rank, device=device, dtype=dtype
+        )
+        index_weights = torch.randn(
+            num_tokens, num_index_q_heads, device=device, dtype=dtype
+        )
+        index_q_fp8 = torch.empty_like(index_q, dtype=current_platform.fp8_dtype())
+        index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+        mqa_q = torch.empty(
+            num_tokens,
+            num_q_heads,
+            kv_lora_rank + qk_rope_head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        inputs[f"numtokens_{num_tokens}"] = (
+            positions,
+            q_pe,
+            q_pe_cos_sin_cache,
+            q_pe_cos_sin_cache.flatten(),
+            index_q,
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.flatten(),
+            ql_nope,
+            1.0,
+            index_weights,
+            index_head_dim**-0.5,
+            num_index_q_heads**-0.5,
+            index_q_fp8,
+            index_weights_out,
+            mqa_q,
+        )
+
+    return inputs
+
+
 if has_helion():
 
-    @helion.kernel(
-        static_shapes=False,
-        autotune_benchmark_fn=_cuda_graph_autotune_benchmark,
+    @register_kernel(
+        op_name="ds32_fused_norm_rope",
+        config_picker=_pick_num_tokens_config,
+        input_generator=generate_ds32_fused_norm_rope_inputs,
     )
     def _fused_norm_rope_helion_kernel(
         positions: torch.Tensor,
@@ -226,7 +365,11 @@ if has_helion():
 
         return q_c_out
 
-    @helion.kernel(static_shapes=False)
+    @register_kernel(
+        op_name="ds32_fused_q",
+        config_picker=_pick_num_tokens_config,
+        input_generator=generate_ds32_fused_q_inputs,
+    )
     def _fused_q_helion_kernel(
         positions: torch.Tensor,
         q_pe: torch.Tensor,
@@ -236,7 +379,7 @@ if has_helion():
         index_q_cos_sin_cache: torch.Tensor,
         index_q_cos_sin_cache_flat: torch.Tensor,
         ql_nope: torch.Tensor,
-        q_scale: torch.Tensor,
+        q_scale: float,
         index_weights: torch.Tensor,
         index_weights_softmax_scale: float,
         index_weights_head_scale: float,
@@ -267,7 +410,6 @@ if has_helion():
                     qpe_sin = q_pe_cos_sin_cache_flat[
                         qpe_base + q_pe_half + qpe_offsets
                     ].to(torch.float32)
-                    qpe_scale = hl.load(q_scale, [0]).to(torch.float32)
                     for local_head in hl.static_range(2):
                         q_head = tile_h * 2 + local_head
                         if q_head < num_q_heads:
@@ -281,10 +423,10 @@ if has_helion():
                             qpe_r2 = qpe_x2 * qpe_cos + qpe_x1 * qpe_sin
                             mqa_q_fp8[
                                 tile_t, q_head, ql_nope_dim + qpe_offsets * 2
-                            ] = (qpe_r1 / qpe_scale).to(mqa_q_fp8.dtype)
+                            ] = qpe_r1.to(mqa_q_fp8.dtype)
                             mqa_q_fp8[
                                 tile_t, q_head, ql_nope_dim + qpe_offsets * 2 + 1
-                            ] = (qpe_r2 / qpe_scale).to(mqa_q_fp8.dtype)
+                            ] = qpe_r2.to(mqa_q_fp8.dtype)
             elif pid == 1:
                 if tile_h < num_index_q_heads:
                     index_offsets = hl.arange(0, index_q_half)
@@ -326,21 +468,20 @@ if has_helion():
             elif pid == 2:
                 if tile_h * 2 < num_q_heads:
                     nope_offsets = hl.arange(0, ql_nope_dim)
-                    nope_scale = hl.load(q_scale, [0]).to(torch.float32)
                     for local_head in hl.static_range(2):
                         q_head = tile_h * 2 + local_head
                         if q_head < num_q_heads:
                             nope_vals = ql_nope[tile_t, q_head, nope_offsets].to(
                                 torch.float32
                             )
-                            mqa_q_fp8[tile_t, q_head, nope_offsets] = (
-                                nope_vals / nope_scale
-                            ).to(mqa_q_fp8.dtype)
+                            mqa_q_fp8[tile_t, q_head, nope_offsets] = nope_vals.to(
+                                mqa_q_fp8.dtype
+                            )
 
     @helion.kernel(static_shapes=False)
     def _fused_q_nope_pack_helion_kernel(
         ql_nope: torch.Tensor,
-        q_scale: torch.Tensor,
+        q_scale: float,
         mqa_q_fp8: torch.Tensor,
     ) -> None:
         num_tokens = ql_nope.size(0)
@@ -348,16 +489,15 @@ if has_helion():
         ql_nope_dim = hl.specialize(ql_nope.shape[2])
         for tile_t, tile_h in hl.tile([num_tokens, num_q_heads]):
             offsets = hl.arange(0, ql_nope_dim)
-            scale = hl.load(q_scale, [0]).to(torch.float32)
             vals = ql_nope[tile_t, tile_h, offsets].to(torch.float32)
-            mqa_q_fp8[tile_t, tile_h, offsets] = (vals / scale).to(mqa_q_fp8.dtype)
+            mqa_q_fp8[tile_t, tile_h, offsets] = vals.to(mqa_q_fp8.dtype)
 
     @helion.kernel(static_shapes=False)
     def _fused_q_pe_pack_helion_kernel(
         positions: torch.Tensor,
         q_pe: torch.Tensor,
         q_pe_cos_sin_cache: torch.Tensor,
-        q_scale: torch.Tensor,
+        q_scale: float,
         mqa_q_fp8: torch.Tensor,
         ql_nope_dim: int,
     ) -> None:
@@ -367,7 +507,6 @@ if has_helion():
         q_pe_half = hl.specialize(q_pe_dim // 2)
         for tile_t, tile_h in hl.tile([num_tokens, num_q_heads]):
             offsets = hl.arange(0, q_pe_half)
-            scale = hl.load(q_scale, [0]).to(torch.float32)
             pos = positions[tile_t]
             cos = q_pe_cos_sin_cache[pos, offsets].to(torch.float32)
             sin = q_pe_cos_sin_cache[pos, q_pe_half + offsets].to(torch.float32)
@@ -375,10 +514,10 @@ if has_helion():
             x2 = q_pe[tile_t, tile_h, offsets * 2 + 1].to(torch.float32)
             r1 = x1 * cos - x2 * sin
             r2 = x2 * cos + x1 * sin
-            mqa_q_fp8[tile_t, tile_h, ql_nope_dim + offsets * 2] = (r1 / scale).to(
+            mqa_q_fp8[tile_t, tile_h, ql_nope_dim + offsets * 2] = r1.to(
                 mqa_q_fp8.dtype
             )
-            mqa_q_fp8[tile_t, tile_h, ql_nope_dim + offsets * 2 + 1] = (r2 / scale).to(
+            mqa_q_fp8[tile_t, tile_h, ql_nope_dim + offsets * 2 + 1] = r2.to(
                 mqa_q_fp8.dtype
             )
 
@@ -490,7 +629,8 @@ def fused_norm_rope_helion(
     # affected.
     global _fused_norm_rope_helion_last_num_tokens
     if _fused_norm_rope_helion_last_num_tokens != num_tokens:
-        _fused_norm_rope_helion_kernel.reset()
+        if hasattr(_fused_norm_rope_helion_kernel, "reset"):
+            _fused_norm_rope_helion_kernel.reset()
         _fused_norm_rope_helion_last_num_tokens = num_tokens
 
     return _fused_norm_rope_helion_kernel(
@@ -525,10 +665,11 @@ def fused_q_helion(
     index_q: torch.Tensor,
     index_q_cos_sin_cache: torch.Tensor,
     ql_nope: torch.Tensor,
-    q_scale: torch.Tensor,
+    q_scale: torch.Tensor | float,
     index_weights: torch.Tensor,
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
+    mqa_q_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Helion version of ``kernels.fused_q``.
 
@@ -548,7 +689,7 @@ def fused_q_helion(
         q_pe.shape[0],
         q_pe.shape[1],
         ql_nope.shape[2] + q_pe.shape[2],
-        dtype=current_platform.fp8_dtype(),
+        dtype=mqa_q_dtype,
         device=q_pe.device,
     )
     index_q_fp8 = torch.empty_like(index_q, dtype=current_platform.fp8_dtype())
@@ -556,9 +697,17 @@ def fused_q_helion(
 
     global _fused_q_helion_last_num_tokens
     if _fused_q_helion_last_num_tokens != positions.shape[0]:
-        _fused_q_helion_kernel.reset()
+        if hasattr(_fused_q_helion_kernel, "reset"):
+            _fused_q_helion_kernel.reset()
         _fused_q_helion_last_num_tokens = positions.shape[0]
 
+    q_scale_value = (
+        q_scale
+        if isinstance(q_scale, float)
+        else float(q_scale.item())
+        if mqa_q_dtype == torch.float8_e4m3fn
+        else 1.0
+    )
     _fused_q_helion_kernel(
         positions,
         q_pe,
@@ -568,7 +717,7 @@ def fused_q_helion(
         index_q_cos_sin_cache,
         index_q_cos_sin_cache.flatten(),
         ql_nope,
-        q_scale,
+        q_scale_value,
         index_weights,
         index_weights_softmax_scale,
         index_weights_head_scale,

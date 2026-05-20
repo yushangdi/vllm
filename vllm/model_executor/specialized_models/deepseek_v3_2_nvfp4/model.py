@@ -13,6 +13,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -135,14 +136,33 @@ class DeepseekV32ForCausalLM(nn.Module):
             DeepseekV2ForCausalLM,
         )
 
+        params_dict = dict(self.named_parameters())
+        loaded_indexer_params: set[str] = set()
+
+        def _try_load_indexer_weight(name: str, w: torch.Tensor) -> bool:
+            remapped_name = remap_weight_name(name)
+            if ".attn.indexer_" not in remapped_name:
+                return False
+            if remapped_name not in params_dict:
+                return True
+
+            param = params_dict[remapped_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, w)
+            loaded_indexer_params.add(remapped_name)
+            return True
+
         def _remap_weights():
             for name, w in weights:
+                if _try_load_indexer_weight(name, w):
+                    continue
                 yield remap_weight_name(name), w
 
         self.use_mha = False
         self.fuse_qkv_a_proj = True
         self.is_fp4_ckpt = False
         loaded = DeepseekV2ForCausalLM.load_weights(self, _remap_weights())
+        loaded.update(loaded_indexer_params)
 
         # Fuse indexer linear weights after loading.
         for layer in self.model.layers:
