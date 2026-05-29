@@ -135,6 +135,7 @@ def generate_ds32_fused_norm_rope_inputs() -> dict[str, tuple[Any, ...]]:
             indexer_cache.view(torch.float32).flatten(),
             mla_cache,
             mla_cache.flatten(),
+            1.0,
         )
 
     return inputs
@@ -238,6 +239,7 @@ if has_helion():
         # MLA KV cache
         mla_cache: torch.Tensor,
         mla_cache_flat: torch.Tensor,
+        mla_k_scale: float,
     ) -> torch.Tensor:
         num_tokens = positions.size(0)
         q_dim = hl.specialize(q_c.shape[1])
@@ -295,15 +297,15 @@ if has_helion():
                 mla_block_idx * mla_block_stride + mla_block_off * mla_entry_stride
             )
             kv_offsets = hl.arange(0, kv_dim)
-            mla_cache_flat[mla_base[:, None] + kv_offsets[None, :]] = kv_normed.to(
-                mla_cache_flat.dtype
-            )
+            mla_cache_flat[mla_base[:, None] + kv_offsets[None, :]] = (
+                kv_normed / mla_k_scale
+            ).to(mla_cache_flat.dtype)
             mla_cache_flat[mla_base[:, None] + kv_dim + kpe_offsets[None, :] * 2] = (
-                kpe_r1.to(mla_cache_flat.dtype)
-            )
+                kpe_r1 / mla_k_scale
+            ).to(mla_cache_flat.dtype)
             mla_cache_flat[
                 mla_base[:, None] + kv_dim + kpe_offsets[None, :] * 2 + 1
-            ] = kpe_r2.to(mla_cache_flat.dtype)
+            ] = (kpe_r2 / mla_k_scale).to(mla_cache_flat.dtype)
 
             # Index K LayerNorm.
             idx_vals = index_k[tile_t, :index_k_dim].to(torch.float32)
@@ -423,10 +425,10 @@ if has_helion():
                             qpe_r2 = qpe_x2 * qpe_cos + qpe_x1 * qpe_sin
                             mqa_q_fp8[
                                 tile_t, q_head, ql_nope_dim + qpe_offsets * 2
-                            ] = qpe_r1.to(mqa_q_fp8.dtype)
+                            ] = (qpe_r1 / q_scale).to(mqa_q_fp8.dtype)
                             mqa_q_fp8[
                                 tile_t, q_head, ql_nope_dim + qpe_offsets * 2 + 1
-                            ] = qpe_r2.to(mqa_q_fp8.dtype)
+                            ] = (qpe_r2 / q_scale).to(mqa_q_fp8.dtype)
             elif pid == 1:
                 if tile_h < num_index_q_heads:
                     index_offsets = hl.arange(0, index_q_half)
@@ -474,8 +476,8 @@ if has_helion():
                             nope_vals = ql_nope[tile_t, q_head, nope_offsets].to(
                                 torch.float32
                             )
-                            mqa_q_fp8[tile_t, q_head, nope_offsets] = nope_vals.to(
-                                mqa_q_fp8.dtype
+                            mqa_q_fp8[tile_t, q_head, nope_offsets] = (
+                                (nope_vals / q_scale).to(mqa_q_fp8.dtype)
                             )
 
     @helion.kernel(static_shapes=False)
@@ -591,7 +593,7 @@ def fused_norm_rope_helion(
     indexer_k_cache: torch.Tensor | None = None,
     mla_kv_cache: torch.Tensor | None = None,
     mla_kv_cache_dtype: str = "auto",
-    mla_k_scale: torch.Tensor | None = None,
+    mla_k_scale: torch.Tensor | float | None = None,
 ) -> torch.Tensor:
     """Helion version of ``kernels.fused_norm_rope``.
 
@@ -617,11 +619,18 @@ def fused_norm_rope_helion(
         indexer_cache_scale_flat = indexer_k_cache.view(torch.float32).flatten()
 
     mla_cache_fp8 = mla_kv_cache_dtype != "auto"
-    if mla_kv_cache is None or mla_cache_fp8:
+    if mla_kv_cache is None:
         raise NotImplementedError(
-            "fused_norm_rope_helion benchmark path currently supports only "
-            "BF16 MLA KV cache."
+            "fused_norm_rope_helion currently requires mla_kv_cache."
         )
+    if mla_cache_fp8 and mla_kv_cache.dtype == torch.uint8:
+        mla_kv_cache = mla_kv_cache.view(current_platform.fp8_dtype())
+    if not mla_cache_fp8 or mla_k_scale is None:
+        mla_k_scale_float = 1.0
+    elif isinstance(mla_k_scale, torch.Tensor):
+        mla_k_scale_float = float(mla_k_scale.item())
+    else:
+        mla_k_scale_float = float(mla_k_scale)
 
     # Helion currently reuses the first bound kernel even when the 1-D tile
     # extent changes, which leaves later tokens unwritten after a T=1 compile.
@@ -655,6 +664,7 @@ def fused_norm_rope_helion(
         indexer_cache_scale_flat,
         mla_kv_cache,
         mla_kv_cache.flatten(),
+        mla_k_scale_float,
     )
 
 

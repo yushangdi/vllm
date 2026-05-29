@@ -39,7 +39,8 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-if bool(int(os.getenv("VLLM_DS32_USE_HELION", "0"))):
+_USE_HELION_KERNELS = bool(int(os.getenv("VLLM_DS32_USE_HELION", "0")))
+if _USE_HELION_KERNELS:
     from .helion_kernels import fused_norm_rope_helion as fused_norm_rope
     from .helion_kernels import fused_q_helion as fused_q
 else:
@@ -86,7 +87,10 @@ def dsa(
         slot_mapping = idx_meta.slot_mapping  # type: ignore[attr-defined]
         indexer_k_cache = attn.indexer_k_cache.kv_cache
         mla_kv_cache = attn.mla_attn.kv_cache
-        mla_k_scale = attn.mla_attn._k_scale
+        if _USE_HELION_KERNELS and attn.mla_attn.kv_cache_dtype.startswith("fp8"):
+            mla_k_scale = attn.mla_attn._k_scale_float
+        else:
+            mla_k_scale = attn.mla_attn._k_scale
 
     q_c = fused_norm_rope(
         positions,
@@ -126,6 +130,14 @@ def dsa(
     ql_nope = torch.bmm(q_nope, mla.W_UK_T)
     ql_nope = ql_nope.transpose(0, 1)
 
+    mqa_q_dtype = (
+        torch.float8_e4m3fn if mla.kv_cache_dtype.startswith("fp8") else q_pe.dtype
+    )
+    q_scale = (
+        mla._q_scale_float
+        if _USE_HELION_KERNELS and mqa_q_dtype == torch.float8_e4m3fn
+        else mla._q_scale
+    )
     index_q_fp8, index_weights, mqa_q = fused_q(
         positions,
         q_pe,
@@ -133,15 +145,11 @@ def dsa(
         index_q,
         attn.indexer_rope_emb.cos_sin_cache,
         ql_nope,
-        mla._q_scale,
+        q_scale,
         index_weights,
         attn.indexer_softmax_scale,
         attn.index_n_heads**-0.5,
-        (
-            torch.float8_e4m3fn
-            if mla.kv_cache_dtype.startswith("fp8")
-            else q_pe.dtype
-        ),
+        mqa_q_dtype,
     )
 
     # Steps 5-6. Sparse indexer + MLA sparse decode attention

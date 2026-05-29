@@ -41,7 +41,9 @@ TORCH_NATIVE_SKIP_VERSION_CHECK=1 \
 python vllm/kernels/helion/ops/bench_deepseek_v32_nvfp4.py \
   --tokens 8,1024 \
   --warmup 10 \
-  --repeat 50
+  --repeat 50 \
+  --mla-kv-cache-dtype both \
+  --mqa-q-dtype both
 ```
 
 The token counts are serving-shaped:
@@ -59,19 +61,43 @@ Lower `*_ms` is better. Ratios below `1.0` mean Helion is faster.
 
 ## Recorded Standalone Result
 
-Recorded command output from `/tmp/ds32_serving_shapes_standalone.log`:
+BF16 MQA result from `/tmp/ds32_serving_shapes_standalone.log`:
 
-| Kernel | Tokens | Correctness | Triton eager ms | Helion eager ms | Helion/Triton |
-| --- | ---: | --- | ---: | ---: | ---: |
-| `fused_norm_rope` | 8 | OK | 0.034163 | 0.080600 | 2.359 |
-| `fused_norm_rope` | 1024 | OK | 0.033638 | 0.079036 | 2.350 |
-| `fused_q_bf16_mqa` | 8 | OK | 0.028989 | 0.093734 | 3.233 |
-| `fused_q_bf16_mqa` | 1024 | OK | 0.410808 | 0.216173 | 0.526 |
+| Kernel | Tokens | Correctness | Triton eager ms | Helion eager ms | Eager H/T | Triton graph ms | Helion graph ms | Graph H/T |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `fused_norm_rope` | 8 | OK | 0.034163 | 0.080600 | 2.359 | N/A | N/A | N/A |
+| `fused_norm_rope` | 1024 | OK | 0.033638 | 0.079036 | 2.350 | N/A | N/A | N/A |
+| `fused_q_bf16_mqa` | 8 | OK | 0.028989 | 0.093734 | 3.233 | N/A | N/A | N/A |
+| `fused_q_bf16_mqa` | 1024 | OK | 0.410808 | 0.216173 | 0.526 | N/A | N/A | N/A |
+
+FP8 MLA cache and FP8 MQA result from `/tmp/ds32_standalone_full_fp8_bench.log`:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+PATH=/home/shangdiy/.conda/envs/pytorch-3.12/bin:$PATH \
+TORCH_NATIVE_SKIP_VERSION_CHECK=1 \
+/home/shangdiy/.conda/envs/pytorch-3.12/bin/python \
+  vllm/kernels/helion/ops/bench_deepseek_v32_nvfp4.py \
+  --tokens 8,1024 \
+  --warmup 10 \
+  --repeat 50 \
+  --mla-kv-cache-dtype fp8 \
+  --mqa-q-dtype fp8 \
+  2>&1 | tee /tmp/ds32_standalone_full_fp8_bench.log
+```
+
+| Kernel | Tokens | Correctness | Triton eager ms | Helion eager ms | Eager H/T | Triton graph ms | Helion graph ms | Graph H/T |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `fused_norm_rope_fp8_mla` | 8 | OK | 0.006256 | 2.429283 | 388.313 | 0.006221 | 0.004289 | 0.689 |
+| `fused_norm_rope_fp8_mla` | 1024 | OK | 0.010316 | 2.464146 | 238.878 | 0.012372 | 0.010371 | 0.838 |
+| `fused_q_fp8_mqa` | 8 | OK | 0.008751 | 2.443978 | 279.289 | 0.008267 | 0.008239 | 0.997 |
+| `fused_q_fp8_mqa` | 1024 | OK | 1.116642 | 2.568621 | 2.300 | 0.938749 | 0.145550 | 0.155 |
 
 Interpretation:
 
 - Eager standalone timing favors Triton for the small launch-dominated shapes.
-- Helion is faster for the large `fused_q_bf16_mqa` shape.
+- Helion is faster under CUDA graph replay for the FP8 MLA cache norm/rope
+  cases and for the large FP8 `fused_q_fp8_mqa` shape.
 - CUDA graph replay is the more relevant mode for vLLM serving with graph
   capture enabled; use the current script output's `*_graph_ms` columns for
   graph replay comparisons.
@@ -96,6 +122,22 @@ Result:
 | Helion autotuned | 2330.67 | 1263.43 | 45.14 | 0.0% |
 
 Helion was `+2.2%` output tok/s in the clean capture-256 serving run.
+
+## Full vLLM FP8 Serving Cross-Check
+
+The FP8 serving comparison used the same workload and did not pass
+`--kv-cache-dtype bfloat16`, so vLLM selected `kv_cache_dtype=fp8_e4m3`.
+
+Result:
+
+| Path | Output tok/s | Total tok/s | Mean TTFT ms | Mean TPOT ms | Prefix cache hit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Triton/default | 1643.69 | 3287.38 | 3767.34 | 48.52 | 0.0% |
+| Helion patched | 1654.95 | 3309.91 | 3692.79 | 48.63 | 0.0% |
+
+Helion patched was `+0.7%` output tok/s in the clean capture-256 FP8 serving
+run. Startup/capture was still slower for Helion: graph capture was `36 s`
+versus `26 s` for Triton/default.
 
 ## Notes
 
