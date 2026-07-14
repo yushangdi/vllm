@@ -12,6 +12,10 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.kernels.helion.routing import (
+    route_per_token_group_fp8_quant,
+    use_helion_per_token_group_fp8_quant,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -635,23 +639,34 @@ def per_token_group_quant_fp8(
     if (
         current_platform.is_cuda_alike() or current_platform.is_xpu()
     ) and x.is_contiguous():
-        from vllm.kernels.helion.routing import route_quant
-
-        # Helion under CUDA-graph capture, native _C in eager (see routing.py).
-        route_quant(
-            "per_token_group_fp8_quant",
-            torch.ops._C.per_token_group_fp8_quant,
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            use_ue8m0,
-            column_major_scales,
-            tma_aligned_scales,
-        )
+        if use_helion_per_token_group_fp8_quant(x):
+            # Keep the large-tensor eager Helion hot path out of torch.ops.
+            route_per_token_group_fp8_quant(
+                torch.ops._C.per_token_group_fp8_quant,
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                use_ue8m0,
+                column_major_scales,
+                tma_aligned_scales,
+            )
+        else:
+            torch.ops._C.per_token_group_fp8_quant(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                use_ue8m0,
+                column_major_scales,
+                tma_aligned_scales,
+            )
         return x_q, x_s
 
     # TRITON FALLBACK

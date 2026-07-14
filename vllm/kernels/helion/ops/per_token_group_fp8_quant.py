@@ -185,6 +185,7 @@ def baseline(
     fake_impl=fake_impl,
     helion_settings=helion.Settings(
         autotune_baseline_fn=baseline,
+        ignore_warnings=[helion.exc.ProcessGroupNameNotFound],
     ),
 )  # type: ignore[misc]
 def per_token_group_fp8_quant(
