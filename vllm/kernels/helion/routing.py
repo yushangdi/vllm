@@ -73,10 +73,9 @@ def _helion_available(op_name: str) -> bool:
 
 
 _PTG_OP_NAME = "per_token_group_fp8_quant"
-_PTG_LAUNCH_CACHE: dict[tuple[Any, ...], Callable[[tuple[object, ...]], None]] = {}
-# Below this size the native vLLM op wins on H100 because launch overhead
-# dominates. Larger prefill tensors still benefit from Helion's faster kernel.
-_PTG_HELION_MIN_ELEMENTS = 5_000_000
+_PTG_LAUNCH_CACHE: dict[tuple[Any, ...], Callable[..., None]] = {}
+_PTG_FAST_LAUNCH_CACHE: dict[tuple[Any, ...], Callable[..., None]] = {}
+_PTG_FAST_LAST: tuple[Any, ...] | None = None
 
 
 def _ptg_dimensions(input: torch.Tensor) -> tuple[int, int] | None:
@@ -88,15 +87,8 @@ def _ptg_dimensions(input: torch.Tensor) -> tuple[int, int] | None:
     return shape[0], shape[1]
 
 
-def _ptg_use_helion(num_tokens: int, hidden_size: int) -> bool:
-    return num_tokens * hidden_size >= _PTG_HELION_MIN_ELEMENTS
-
-
-def use_helion_per_token_group_fp8_quant(input: torch.Tensor) -> bool:
-    if not _use_helion_kernels() or _is_compiling():
-        return False
-    dimensions = _ptg_dimensions(input)
-    return dimensions is not None and _ptg_use_helion(*dimensions)
+def use_helion_per_token_group_fp8_quant() -> bool:
+    return _use_helion_kernels() and not _is_compiling()
 
 
 def _ptg_cache_key(
@@ -112,51 +104,32 @@ def _ptg_cache_key(
     dummy_is_tma_aligned: bool,
     dimensions: tuple[int, int] | None = None,
 ) -> tuple[Any, ...] | None:
-    if (
-        input.__class__ is not torch.Tensor
-        or output_q.__class__ is not torch.Tensor
-        or output_s.__class__ is not torch.Tensor
-        or type(group_size) is not int
-        or type(eps) is not float
-        or type(fp8_min) is not float
-        or type(fp8_max) is not float
-        or type(scale_ue8m0) is not bool
-        or type(dummy_is_scale_transposed) is not bool
-        or type(dummy_is_tma_aligned) is not bool
-    ):
-        return None
-
     if dimensions is None:
         dimensions = _ptg_dimensions(input)
         if dimensions is None:
             return None
     num_tokens, hidden_size = dimensions
-    if output_q.ndim != 2 or output_s.ndim != 2:
+    # Call-site invariant: fp8_utils.py already checked input/output shapes and
+    # allocated output_s with the layout encoded by the two dummy flags. Keep
+    # only guards that protect reuse of a cached aligned fused-launch closure.
+    if group_size <= 0 or hidden_size % group_size != 0:
         return None
-    if group_size <= 0:
-        return None
-
-    if hidden_size % group_size != 0:
-        return None
-    if output_q.shape != (num_tokens, hidden_size):
-        return None
-    if output_s.shape != (num_tokens, hidden_size // group_size):
-        return None
-    if input.device != output_q.device or input.device != output_s.device:
-        return None
+    groups_per_row = hidden_size // group_size
     if input.stride() != (hidden_size, 1) or output_q.stride() != (hidden_size, 1):
         return None
     # If an unusual view is unaligned, let Helion's own generic dispatch key
     # handle it instead of reusing a cached aligned launch closure.
     if (input.data_ptr() | output_q.data_ptr() | output_s.data_ptr()) & 15:
         return None
-    if (
-        getattr(input, "_dynamo_static_indices", None) is not None
-        or getattr(output_q, "_dynamo_static_indices", None) is not None
-        or getattr(output_s, "_dynamo_static_indices", None) is not None
-    ):
-        return None
-
+    if dummy_is_scale_transposed:
+        tma_aligned_m = (
+            ((num_tokens + 1023) // 1024) * 1024
+            if dummy_is_tma_aligned
+            else num_tokens
+        )
+        output_s_stride = (1, tma_aligned_m)
+    else:
+        output_s_stride = (groups_per_row, 1)
     return (
         num_tokens,
         hidden_size,
@@ -164,7 +137,7 @@ def _ptg_cache_key(
         input.device,
         output_q.dtype,
         output_s.dtype,
-        output_s.stride(),
+        output_s_stride,
         group_size,
         eps,
         fp8_min,
@@ -175,18 +148,29 @@ def _ptg_cache_key(
     )
 
 
-def _ptg_current_launch(
+def _ptg_current_launches(
     kernel: Callable,
     args: tuple[object, ...],
-) -> Callable[[tuple[object, ...]], None] | None:
+) -> tuple[Callable[..., None], Callable[..., None] | None] | None:
     key_fn = getattr(kernel, "_fused_key_fn", None)
     recipes = getattr(kernel, "_fused_recipes", None)
     if key_fn is None or not recipes:
         return None
     try:
-        return recipes.get(key_fn(args))
+        launch = recipes.get(key_fn(args))
     except Exception:
         return None
+    if launch is None:
+        return None
+    direct_launch = getattr(launch, "_helion_trusted_direct_launch", None)
+    if direct_launch is None:
+        direct_launch = getattr(launch, "_helion_direct_launch", None)
+    if direct_launch is None:
+        return None
+    tensor_launch = getattr(launch, "_helion_trusted_tensor_direct_launch", None)
+    if tensor_launch is None:
+        tensor_launch = getattr(launch, "_helion_tensor_direct_launch", None)
+    return direct_launch, tensor_launch
 
 
 def _is_globals_changed(exc: Exception) -> bool:
@@ -211,24 +195,10 @@ def route_per_token_group_fp8_quant(
     dummy_is_tma_aligned: bool = False,
 ):
     """Fast route for vLLM's eager per-token-group fp8 quant call site."""
-    if use_helion_per_token_group_fp8_quant(input):
+    if use_helion_per_token_group_fp8_quant():
         dimensions = _ptg_dimensions(input)
-        assert dimensions is not None
-        kernel = _checked_eager_kernel(_PTG_OP_NAME)
-        if kernel is not None:
-            args = (
-                input,
-                output_q,
-                output_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                scale_ue8m0,
-                dummy_is_scale_transposed,
-                dummy_is_tma_aligned,
-            )
-            cache_key = _ptg_cache_key(
+        if dimensions is not None:
+            result = launch_per_token_group_fp8_quant(
                 input,
                 output_q,
                 output_s,
@@ -241,24 +211,8 @@ def route_per_token_group_fp8_quant(
                 dummy_is_tma_aligned,
                 dimensions,
             )
-            if cache_key is not None:
-                launch = _PTG_LAUNCH_CACHE.get(cache_key)
-                if launch is not None and getattr(kernel, "_fused_recipes", None):
-                    try:
-                        return launch(args)
-                    except Exception as exc:
-                        if not _is_globals_changed(exc):
-                            raise
-                        _PTG_LAUNCH_CACHE.pop(cache_key, None)
-
-            result = kernel(*args)
-            if cache_key is not None:
-                launch = _ptg_current_launch(kernel, args)
-                if launch is not None:
-                    if len(_PTG_LAUNCH_CACHE) >= 128:
-                        _PTG_LAUNCH_CACHE.clear()
-                    _PTG_LAUNCH_CACHE[cache_key] = launch
-            return result
+            if result is not _PTG_FALLBACK:
+                return result
 
     return fn(
         input,
@@ -272,6 +226,166 @@ def route_per_token_group_fp8_quant(
         dummy_is_scale_transposed,
         dummy_is_tma_aligned,
     )
+
+
+_PTG_FALLBACK = object()
+
+
+def launch_per_token_group_fp8_quant(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    scale_ue8m0: bool,
+    dummy_is_scale_transposed: bool,
+    dummy_is_tma_aligned: bool,
+    dimensions: tuple[int, int],
+):
+    """Helion-only fast path for the 2D fp8_utils.py callsite."""
+    global _PTG_FAST_LAST
+
+    num_tokens, hidden_size = dimensions
+    fast_cache_key: tuple[Any, ...] | None = None
+    if (
+        group_size > 0
+        and hidden_size % group_size == 0
+        and not (input.data_ptr() | output_q.data_ptr() | output_s.data_ptr()) & 15
+    ):
+        input_dtype = input.dtype
+        input_device = input.device
+        output_q_dtype = output_q.dtype
+        output_s_dtype = output_s.dtype
+        last = _PTG_FAST_LAST
+        if (
+            last is not None
+            and num_tokens == last[0]
+            and hidden_size == last[1]
+            and input_dtype is last[2]
+            and input_device == last[3]
+            and output_q_dtype is last[4]
+            and output_s_dtype is last[5]
+            and group_size == last[6]
+            and eps == last[7]
+            and fp8_min == last[8]
+            and fp8_max == last[9]
+            and scale_ue8m0 == last[10]
+            and dummy_is_scale_transposed == last[11]
+            and dummy_is_tma_aligned == last[12]
+        ):
+            try:
+                return last[13](input, output_q, output_s)
+            except Exception as exc:
+                if not _is_globals_changed(exc):
+                    raise
+                _PTG_FAST_LAST = None
+
+        fast_cache_key = (
+            num_tokens,
+            hidden_size,
+            input_dtype,
+            input_device,
+            output_q_dtype,
+            output_s_dtype,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            dummy_is_scale_transposed,
+            dummy_is_tma_aligned,
+        )
+    if fast_cache_key is not None:
+        launch = _PTG_FAST_LAUNCH_CACHE.get(fast_cache_key)
+        if launch is not None:
+            try:
+                result = launch(input, output_q, output_s)
+                _PTG_FAST_LAST = (*fast_cache_key, launch)
+                return result
+            except Exception as exc:
+                if not _is_globals_changed(exc):
+                    raise
+                _PTG_FAST_LAUNCH_CACHE.pop(fast_cache_key, None)
+                if _PTG_FAST_LAST is not None and _PTG_FAST_LAST[13] is launch:
+                    _PTG_FAST_LAST = None
+
+    kernel = _checked_eager_kernel(_PTG_OP_NAME)
+    if kernel is None:
+        return _PTG_FALLBACK
+
+    args = (
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        dummy_is_scale_transposed,
+        dummy_is_tma_aligned,
+    )
+    cache_key = _ptg_cache_key(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        dummy_is_scale_transposed,
+        dummy_is_tma_aligned,
+        dimensions,
+    )
+    if cache_key is not None:
+        launch = _PTG_LAUNCH_CACHE.get(cache_key)
+        if launch is not None and getattr(kernel, "_fused_recipes", None):
+            try:
+                result = launch(
+                    input,
+                    output_q,
+                    output_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    dummy_is_scale_transposed,
+                    dummy_is_tma_aligned,
+                )
+                tensor_launch = getattr(
+                    launch, "_helion_trusted_tensor_direct_launch", None
+                )
+                if tensor_launch is None:
+                    tensor_launch = getattr(
+                        launch, "_helion_tensor_direct_launch", None
+                    )
+                if fast_cache_key is not None and tensor_launch is not None:
+                    _PTG_FAST_LAUNCH_CACHE[fast_cache_key] = tensor_launch
+                    _PTG_FAST_LAST = (*fast_cache_key, tensor_launch)
+                return result
+            except Exception as exc:
+                if not _is_globals_changed(exc):
+                    raise
+                _PTG_LAUNCH_CACHE.pop(cache_key, None)
+
+    result = kernel(*args)
+    if cache_key is not None:
+        launches = _ptg_current_launches(kernel, args)
+        if launches is not None:
+            launch, tensor_launch = launches
+            if len(_PTG_LAUNCH_CACHE) >= 128:
+                _PTG_LAUNCH_CACHE.clear()
+                _PTG_FAST_LAUNCH_CACHE.clear()
+                _PTG_FAST_LAST = None
+            _PTG_LAUNCH_CACHE[cache_key] = launch
+            if fast_cache_key is not None and tensor_launch is not None:
+                _PTG_FAST_LAUNCH_CACHE[fast_cache_key] = tensor_launch
+                _PTG_FAST_LAST = (*fast_cache_key, tensor_launch)
+    return result
 
 
 def route_quant(op_name: str, fn: Callable, *args):
