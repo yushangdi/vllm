@@ -75,7 +75,21 @@ def _helion_available(op_name: str) -> bool:
 _PTG_OP_NAME = "per_token_group_fp8_quant"
 _PTG_LAUNCH_CACHE: dict[tuple[Any, ...], Callable[..., None]] = {}
 _PTG_FAST_LAUNCH_CACHE: dict[tuple[Any, ...], Callable[..., None]] = {}
+_PTG_CPP_LAUNCH_CACHE: dict[tuple[Any, ...], object] = {}
 _PTG_FAST_LAST: tuple[Any, ...] | None = None
+_PTG_CPP_LAST: tuple[Any, ...] | None = None
+
+
+def _ptg_dtype_tag(dtype: torch.dtype) -> int:
+    if dtype is torch.bfloat16:
+        return 1
+    if dtype is torch.float16:
+        return 2
+    if dtype is torch.float32:
+        return 3
+    if dtype is torch.float8_e4m3fn:
+        return 4
+    return 0
 
 
 def _ptg_dimensions(input: torch.Tensor) -> tuple[int, int] | None:
@@ -181,6 +195,115 @@ def _is_globals_changed(exc: Exception) -> bool:
     )
 
 
+def _ptg_make_cpp_launcher(
+    fast_cache_key: tuple[Any, ...],
+    tensor_launch: Callable[..., None],
+) -> object | None:
+    try:
+        from vllm.kernels.helion import cpp_launch
+
+        namespace = tensor_launch.__globals__  # type: ignore[attr-defined]
+        compiled = namespace["_compiled"]
+        metadata = compiled.metadata
+        signature = getattr(compiled.src, "signature", None)
+        constants = getattr(compiled.src, "constants", None)
+        signature_values = list(signature.values())
+        if (
+            signature_values[:9]
+            != [
+                "*bf16",
+                "*fp32",
+                "*fp8e4nv",
+                "i32",
+                "i32",
+                "constexpr",
+                "i32",
+                "i32",
+                "constexpr",
+            ]
+            or signature_values[11:]
+            != [
+                "fp32",
+                "fp32",
+                "u1",
+                "fp32",
+            ]
+            or (signature_values[9], signature_values[10])
+            not in {
+                ("i32", "constexpr"),
+                ("constexpr", "i32"),
+            }
+        ):
+            return None
+        output_s_stride0_const = signature_values[9] == "constexpr"
+        scale_const_index = (9,) if output_s_stride0_const else (10,)
+        scale_const_value = namespace["_c9" if output_s_stride0_const else "_c10"]
+        if not isinstance(constants, dict) or (
+            constants.get((5,)) != namespace["_c5"]
+            or constants.get((8,)) != namespace["_c8"]
+            or constants.get(scale_const_index) != scale_const_value
+        ):
+            return None
+        if (
+            int(getattr(metadata, "num_ctas", 1)) != 1
+            or bool(getattr(metadata, "launch_cooperative_grid", False))
+            or bool(getattr(metadata, "launch_pdl", False))
+            or int(getattr(metadata, "global_scratch_size", 0)) != 0
+            or int(getattr(metadata, "profile_scratch_size", 0)) != 0
+        ):
+            return None
+        return cpp_launch.module().PtgFp8Launcher(
+            int(compiled.function),
+            int(fast_cache_key[0]),
+            int(fast_cache_key[1]),
+            _ptg_dtype_tag(fast_cache_key[2]),
+            int(fast_cache_key[3].index or 0),
+            _ptg_dtype_tag(fast_cache_key[4]),
+            _ptg_dtype_tag(fast_cache_key[5]),
+            int(fast_cache_key[6]),
+            float(fast_cache_key[7]),
+            float(fast_cache_key[8]),
+            float(fast_cache_key[9]),
+            bool(fast_cache_key[10]),
+            bool(fast_cache_key[11]),
+            bool(fast_cache_key[12]),
+            output_s_stride0_const,
+            int(namespace["_gx"]),
+            int(namespace["_gy"]),
+            int(namespace["_gz"]),
+            int(metadata.num_warps),
+            int(metadata.shared),
+            int(namespace["_c3"]),
+            int(namespace["_c4"]),
+            int(namespace["_c5"]),
+            int(namespace["_c6"]),
+            int(namespace["_c7"]),
+            int(namespace["_c8"]),
+            int(namespace["_c9"]),
+            int(namespace["_c10"]),
+            float(namespace["_c11"]),
+            float(namespace["_c12"]),
+            bool(namespace["_c13"]),
+            float(namespace["_c14"]),
+        )
+    except Exception:
+        return None
+
+
+def _ptg_cache_fast_launch(
+    fast_cache_key: tuple[Any, ...],
+    tensor_launch: Callable[..., None],
+) -> None:
+    global _PTG_CPP_LAST, _PTG_FAST_LAST
+
+    _PTG_FAST_LAUNCH_CACHE[fast_cache_key] = tensor_launch
+    _PTG_FAST_LAST = (*fast_cache_key, tensor_launch)
+    cpp_launcher = _ptg_make_cpp_launcher(fast_cache_key, tensor_launch)
+    if cpp_launcher is not None:
+        _PTG_CPP_LAUNCH_CACHE[fast_cache_key] = cpp_launcher
+        _PTG_CPP_LAST = (*fast_cache_key, cpp_launcher)
+
+
 def route_per_token_group_fp8_quant(
     fn: Callable,
     input: torch.Tensor,
@@ -195,24 +318,19 @@ def route_per_token_group_fp8_quant(
     dummy_is_tma_aligned: bool = False,
 ):
     """Fast route for vLLM's eager per-token-group fp8 quant call site."""
-    if use_helion_per_token_group_fp8_quant():
-        dimensions = _ptg_dimensions(input)
-        if dimensions is not None:
-            result = launch_per_token_group_fp8_quant(
-                input,
-                output_q,
-                output_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                scale_ue8m0,
-                dummy_is_scale_transposed,
-                dummy_is_tma_aligned,
-                dimensions,
-            )
-            if result is not _PTG_FALLBACK:
-                return result
+    if try_launch_per_token_group_fp8_quant(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        dummy_is_scale_transposed,
+        dummy_is_tma_aligned,
+    ):
+        return None
 
     return fn(
         input,
@@ -228,10 +346,7 @@ def route_per_token_group_fp8_quant(
     )
 
 
-_PTG_FALLBACK = object()
-
-
-def launch_per_token_group_fp8_quant(
+def try_launch_per_token_group_fp8_quant(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
@@ -242,11 +357,36 @@ def launch_per_token_group_fp8_quant(
     scale_ue8m0: bool,
     dummy_is_scale_transposed: bool,
     dummy_is_tma_aligned: bool,
-    dimensions: tuple[int, int],
-):
+    dimensions: tuple[int, int] | None = None,
+) -> bool:
     """Helion-only fast path for the 2D fp8_utils.py callsite."""
-    global _PTG_FAST_LAST
+    global _PTG_CPP_LAST, _PTG_FAST_LAST
 
+    if not use_helion_per_token_group_fp8_quant() or not output_q.is_contiguous():
+        return False
+    cpp_last = _PTG_CPP_LAST
+    if cpp_last is not None:
+        try:
+            if cpp_last[13].launch(
+                input,
+                output_q,
+                output_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                dummy_is_scale_transposed,
+                dummy_is_tma_aligned,
+            ):
+                return True
+        except Exception:
+            _PTG_CPP_LAST = None
+            raise
+    if dimensions is None:
+        dimensions = _ptg_dimensions(input)
+        if dimensions is None:
+            return False
     num_tokens, hidden_size = dimensions
     fast_cache_key: tuple[Any, ...] | None = None
     if (
@@ -276,7 +416,8 @@ def launch_per_token_group_fp8_quant(
             and dummy_is_tma_aligned == last[12]
         ):
             try:
-                return last[13](input, output_q, output_s)
+                last[13](input, output_q, output_s)
+                return True
             except Exception as exc:
                 if not _is_globals_changed(exc):
                     raise
@@ -297,23 +438,48 @@ def launch_per_token_group_fp8_quant(
             dummy_is_scale_transposed,
             dummy_is_tma_aligned,
         )
+        cpp_launch = _PTG_CPP_LAUNCH_CACHE.get(fast_cache_key)
+        if cpp_launch is not None:
+            if cpp_launch.launch(
+                input,
+                output_q,
+                output_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                dummy_is_scale_transposed,
+                dummy_is_tma_aligned,
+            ):
+                _PTG_CPP_LAST = (*fast_cache_key, cpp_launch)
+                return True
+            _PTG_CPP_LAUNCH_CACHE.pop(fast_cache_key, None)
+            if _PTG_CPP_LAST is not None and _PTG_CPP_LAST[13] is cpp_launch:
+                _PTG_CPP_LAST = None
     if fast_cache_key is not None:
         launch = _PTG_FAST_LAUNCH_CACHE.get(fast_cache_key)
         if launch is not None:
             try:
-                result = launch(input, output_q, output_s)
+                launch(input, output_q, output_s)
                 _PTG_FAST_LAST = (*fast_cache_key, launch)
-                return result
+                return True
             except Exception as exc:
                 if not _is_globals_changed(exc):
                     raise
                 _PTG_FAST_LAUNCH_CACHE.pop(fast_cache_key, None)
+                _PTG_CPP_LAUNCH_CACHE.pop(fast_cache_key, None)
                 if _PTG_FAST_LAST is not None and _PTG_FAST_LAST[13] is launch:
                     _PTG_FAST_LAST = None
+                if (
+                    _PTG_CPP_LAST is not None
+                    and _PTG_CPP_LAST[:13] == fast_cache_key
+                ):
+                    _PTG_CPP_LAST = None
 
     kernel = _checked_eager_kernel(_PTG_OP_NAME)
     if kernel is None:
-        return _PTG_FALLBACK
+        return False
 
     args = (
         input,
@@ -344,7 +510,7 @@ def launch_per_token_group_fp8_quant(
         launch = _PTG_LAUNCH_CACHE.get(cache_key)
         if launch is not None and getattr(kernel, "_fused_recipes", None):
             try:
-                result = launch(
+                launch(
                     input,
                     output_q,
                     output_s,
@@ -362,17 +528,16 @@ def launch_per_token_group_fp8_quant(
                 if tensor_launch is None:
                     tensor_launch = getattr(
                         launch, "_helion_tensor_direct_launch", None
-                    )
+                )
                 if fast_cache_key is not None and tensor_launch is not None:
-                    _PTG_FAST_LAUNCH_CACHE[fast_cache_key] = tensor_launch
-                    _PTG_FAST_LAST = (*fast_cache_key, tensor_launch)
-                return result
+                    _ptg_cache_fast_launch(fast_cache_key, tensor_launch)
+                return True
             except Exception as exc:
                 if not _is_globals_changed(exc):
                     raise
                 _PTG_LAUNCH_CACHE.pop(cache_key, None)
 
-    result = kernel(*args)
+    kernel(*args)
     if cache_key is not None:
         launches = _ptg_current_launches(kernel, args)
         if launches is not None:
@@ -380,12 +545,13 @@ def launch_per_token_group_fp8_quant(
             if len(_PTG_LAUNCH_CACHE) >= 128:
                 _PTG_LAUNCH_CACHE.clear()
                 _PTG_FAST_LAUNCH_CACHE.clear()
+                _PTG_CPP_LAUNCH_CACHE.clear()
                 _PTG_FAST_LAST = None
+                _PTG_CPP_LAST = None
             _PTG_LAUNCH_CACHE[cache_key] = launch
             if fast_cache_key is not None and tensor_launch is not None:
-                _PTG_FAST_LAUNCH_CACHE[fast_cache_key] = tensor_launch
-                _PTG_FAST_LAST = (*fast_cache_key, tensor_launch)
-    return result
+                _ptg_cache_fast_launch(fast_cache_key, tensor_launch)
+    return True
 
 
 def route_quant(op_name: str, fn: Callable, *args):

@@ -636,54 +636,19 @@ def per_token_group_quant_fp8(
     if (
         current_platform.is_cuda_alike() or current_platform.is_xpu()
     ) and x.is_contiguous():
-        if (
-            helion_routing.use_helion_per_token_group_fp8_quant()
-            and x.dim() == 2
-            and x_q.is_contiguous()
+        if helion_routing.try_launch_per_token_group_fp8_quant(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            use_ue8m0,
+            column_major_scales,
+            tma_aligned_scales,
         ):
-            num_tokens, hidden_size = x.shape[0], x.shape[1]
-            last = helion_routing._PTG_FAST_LAST
-            if (
-                last is not None
-                and not (x.data_ptr() | x_q.data_ptr() | x_s.data_ptr()) & 15
-                and num_tokens == last[0]
-                and hidden_size == last[1]
-                and x.dtype is last[2]
-                and x.device == last[3]
-                and x_q.dtype is last[4]
-                and x_s.dtype is last[5]
-                and group_size == last[6]
-                and eps == last[7]
-                and fp8_min == last[8]
-                and fp8_max == last[9]
-                and use_ue8m0 == last[10]
-                and column_major_scales == last[11]
-                and tma_aligned_scales == last[12]
-            ):
-                try:
-                    last[13](x, x_q, x_s)
-                    return x_q, x_s
-                except Exception as exc:
-                    if not helion_routing._is_globals_changed(exc):
-                        raise
-                    helion_routing._PTG_FAST_LAST = None
-
-            # Keep the eager Helion hot path out of torch.ops.
-            result = helion_routing.launch_per_token_group_fp8_quant(
-                x,
-                x_q,
-                x_s,
-                group_size,
-                eps,
-                fp8_min,
-                fp8_max,
-                use_ue8m0,
-                column_major_scales,
-                tma_aligned_scales,
-                (num_tokens, hidden_size),
-            )
-            if result is not helion_routing._PTG_FALLBACK:
-                return x_q, x_s
+            return x_q, x_s
         torch.ops._C.per_token_group_fp8_quant(
             x,
             x_q,
