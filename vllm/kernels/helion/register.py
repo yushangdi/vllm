@@ -349,6 +349,19 @@ class HelionKernelWrapper:
             )
         return self._configured_kernel
 
+    def eager_callable(self) -> Callable[..., Any]:
+        """Direct callable for the eager/capture path.
+
+        Returns the configured helion kernel itself, bypassing the torch
+        custom-op dispatch boundary (schema + C++ round-trip) and the
+        ``HelionKernelWrapper.__call__`` indirection. That boundary exists only
+        so the *compiled* FX-swap pass can emit ``torch.ops.vllm_helion.*``
+        nodes; in plain eager or during CUDA-graph capture it is pure per-call
+        host overhead (~4us). The custom op stays registered for the compiled
+        path -- this only changes how eager call sites reach the kernel.
+        """
+        return self.get_configured_op()._decorated_kernel
+
     def _get_or_register_custom_op(self) -> Any:
         if hasattr(torch.ops.vllm_helion, self.op_name):
             return getattr(torch.ops.vllm_helion, self.op_name)
